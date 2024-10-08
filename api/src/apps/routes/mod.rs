@@ -24,8 +24,10 @@
  * =========================LICENSE_END==================================
  */
 
-use crate::apps::HostMetaCache;
+use crate::apps::deployment_queue::DeploymentParameters;
+use crate::apps::peekable_receiver::PeekableReceiver;
 use crate::apps::{Apps, AppsError};
+use crate::apps::{AppsServiceError, HostMetaCache};
 use crate::http_result::{HttpApiError, HttpResult};
 use crate::models::request_info::RequestInfo;
 use crate::models::service::{Service, ServiceStatus};
@@ -41,10 +43,17 @@ use rocket::response::{Responder, Response};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::future::Future;
+use std::ptr::null;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time;
+use tokio::time::error::Elapsed;
 use tokio::time::timeout;
+use yansi::Paint;
 
 mod logs;
 
@@ -77,18 +86,26 @@ async fn status_change(
     app_name: Result<AppName, AppNameError>,
     status_id: Result<AppStatusChangeId, AppStatusChangeIdError>,
     apps: &State<Arc<Apps>>,
+    receiver: &State<Arc<Mutex<Receiver<DeploymentParameters>>>>,
     options: RunOptions,
 ) -> HttpResult<AsyncCompletion<Json<Vec<Service>>>> {
     let app_name = app_name?;
     let status_id = status_id?;
 
     let apps = (**apps).clone();
-    let future = async move { apps.wait_for_status_change(&status_id).await };
 
-    match spawn_with_options(options, future).await? {
+    let mut peekable_receiver = PeekableReceiver {
+        rx: (**receiver).clone(),
+        peeked: None,
+    };
+
+
+    let mut x = peekable_receiver.peek();
+
+    match spawn_with_options(options, x).await ? {
         Poll::Pending => Ok(AsyncCompletion::Pending(app_name, status_id)),
-        Poll::Ready(Ok(_)) => Err(HttpApiProblem::with_title(StatusCode::NOT_FOUND).into()),
-        Poll::Ready(Err(err)) => Err(err.into()),
+        Poll::Ready(Some(_)) => Ok(AsyncCompletion::Ready(Json(Vec::new()))),
+        Poll::Ready(None) => Err(HttpApiProblem::with_title(StatusCode::NOT_FOUND).into()),
     }
 }
 
@@ -131,7 +148,7 @@ pub async fn delete_app_sync(
 )]
 pub async fn create_app(
     app_name: Result<AppName, AppNameError>,
-    apps: &State<Arc<Apps>>,
+    apps: &State<tokio::sync::mpsc::Sender<DeploymentParameters>>,
     create_app_form: CreateAppOptions,
     service_configs: Result<Json<Vec<ServiceConfig>>, rocket::serde::json::Error<'_>>,
     options: RunOptions,
@@ -150,21 +167,49 @@ pub async fn create_app(
     let app_name_cloned = app_name.clone();
     let replicate_from = create_app_form.replicate_from().clone();
 
-    let apps = (**apps).clone();
-    let future = async move {
-        apps.create_or_update(
-            &app_name.clone(),
-            &status_id,
-            replicate_from,
-            &service_configs,
-        )
-        .await
-    };
+    let deployment_sender = (**apps).clone();
 
-    match spawn_with_options(options, future).await? {
-        Poll::Pending => Ok(AsyncCompletion::Pending(app_name_cloned, status_id)),
-        Poll::Ready(Ok(services)) => Ok(AsyncCompletion::Ready(Json(services))),
-        Poll::Ready(Err(err)) => Err(err.into()),
+    let (tx, rx) = oneshot::channel();
+
+    deployment_sender
+        .send(DeploymentParameters {
+            app_name: app_name,
+            status_id: status_id,
+            replicate_from: replicate_from,
+            service_configs: service_configs.0,
+            sender: tx,
+        })
+        .await
+        .unwrap();
+
+    match options {
+        RunOptions::Sync => match tokio::spawn(rx).await {
+            Ok(v) => match v {
+                Ok(services) => Ok(AsyncCompletion::Ready(Json(services?))),
+                Err(_) => Err(
+                    HttpApiProblem::with_title(StatusCode::INTERNAL_SERVER_ERROR)
+                        .detail("Server error, internal processing error due to shutdown")
+                        .into(),
+                ),
+            },
+            Err(_) => Ok(AsyncCompletion::Pending(app_name_cloned, status_id)),
+        },
+        RunOptions::Async { wait: None } => {
+            Ok(AsyncCompletion::Pending(app_name_cloned, status_id))
+        }
+        RunOptions::Async {
+            wait: Some(duration),
+        } => match tokio::spawn(timeout(duration, rx)).await {
+            Ok(v) => match v {
+                Ok(services) => Ok(AsyncCompletion::Pending(app_name_cloned, status_id)),
+                Err(_) => Err(
+                    HttpApiProblem::with_title(StatusCode::INTERNAL_SERVER_ERROR)
+                        .detail("Server error, internal processing error due to shutdown")
+                        .into(),
+                ),
+            },
+            Err(_) => Ok(AsyncCompletion::Pending(app_name_cloned, status_id)),
+        },
     }
 }
 
@@ -449,7 +494,7 @@ mod tests {
     }
 
     mod url_rendering {
-        use crate::apps::{AppsService, HostMetaCache};
+        use crate::apps::{AppsService, DeploymentQueue, HostMetaCache};
         use crate::infrastructure::Dummy;
         use crate::models::{AppName, AppStatusChangeId};
         use crate::sc;
@@ -468,6 +513,10 @@ mod tests {
         ) -> Result<Client, crate::apps::AppsServiceError> {
             let infrastructure = Box::new(Dummy::new());
             let apps = Arc::new(AppsService::new(Default::default(), infrastructure).unwrap());
+            let (deployment_queue, deployment_sender) = DeploymentQueue::new();
+
+            deployment_queue.spawn(apps.clone());
+
             let _result = apps
                 .create_or_update(
                     &AppName::master(),
@@ -480,6 +529,7 @@ mod tests {
             let rocket = rocket::build()
                 .manage(host_meta_cache)
                 .manage(apps)
+                .manage(deployment_sender)
                 .mount("/", routes![crate::apps::routes::apps])
                 .mount("/api/apps", crate::apps::apps_routes());
             Ok(Client::tracked(rocket).await.expect("valid rocket"))
@@ -692,21 +742,30 @@ mod tests {
 
     mod http_api_error {
         use super::super::*;
+        use crate::apps::DeploymentQueue;
         use crate::{
             apps::{AppsError, AppsService},
             infrastructure::Dummy,
             registry::RegistryError,
         };
         use assert_json_diff::assert_json_eq;
+        use http::header::CONTENT_TYPE;
+        use rocket::http::Header;
         use rocket::{http::ContentType, local::asynchronous::Client};
+        use serde_json::json;
 
         #[tokio::test]
         async fn invalid_service_payload() {
             let infrastructure = Box::new(Dummy::new());
             let apps = Arc::new(AppsService::new(Default::default(), infrastructure).unwrap());
 
+            let (deployment_queue, deployment_sender) = DeploymentQueue::new();
+
+            deployment_queue.spawn(apps.clone());
+
             let rocket = rocket::build()
                 .manage(apps)
+                .manage(deployment_sender)
                 .mount("/", routes![crate::apps::routes::create_app]);
 
             let client = Client::tracked(rocket).await.expect("valid rocket");
@@ -733,6 +792,49 @@ mod tests {
                     "status": 400,
                     "title": "Bad Request",
                     "detail": "Invalid image: private-registry.example.com/_/postgres at line 1 column 51"
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn valid_service_request() {
+            let infrastructure = Box::new(Dummy::with_delay(Duration::from_secs(10)));
+            let apps = Arc::new(AppsService::new(Default::default(), infrastructure).unwrap());
+
+            let (deployment_queue, deployment_sender) = DeploymentQueue::new();
+
+            deployment_queue.spawn(apps.clone());
+
+            let rocket = rocket::build()
+                .manage(apps)
+                .manage(deployment_sender)
+                .mount("/", routes![crate::apps::routes::create_app]);
+
+            let client = Client::tracked(rocket).await.expect("valid rocket");
+            let response = client
+                .post("/latest?replicate_from=no-copy")
+                .body(
+                    serde_json::json!([{
+                        "serviceName": "db",
+                        "image": "mariadb"
+                    }])
+                    .to_string(),
+                )
+                .header(ContentType::JSON)
+                .header(Header::new("Prefer", "respond-sync, wait=7"))
+                .dispatch()
+                .await;
+
+            assert_eq!(response.status(), Status::Accepted);
+
+            let body = response.into_string().await.unwrap();
+            assert_json_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "type": "https://httpstatuses.com/202",
+                    "status": 202,
+                    "title": "Accepted",
+                    "detail": "Pending"
                 })
             );
         }

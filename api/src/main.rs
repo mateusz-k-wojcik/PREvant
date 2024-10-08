@@ -33,6 +33,7 @@ extern crate serde_derive;
 
 use crate::apps::host_meta_crawling;
 use crate::apps::Apps;
+use crate::apps::DeploymentQueue;
 use crate::config::{Config, Runtime};
 use crate::infrastructure::{Docker, Infrastructure, Kubernetes};
 use crate::models::request_info::RequestInfo;
@@ -42,6 +43,7 @@ use serde_yaml::{from_reader, to_string, Value};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 mod apps;
 mod config;
@@ -108,10 +110,17 @@ async fn main() -> Result<(), StartUpError> {
     let (host_meta_cache, host_meta_crawler) = host_meta_crawling();
     host_meta_crawler.spawn(apps.clone());
 
+    let (deployment_queue, deployment_sender) = DeploymentQueue::new();
+    let queue_clone = Arc::new(deployment_queue.clone());
+
+    deployment_queue.spawn(apps.clone());
+
     let _rocket = rocket::build()
         .manage(config)
         .manage(apps)
         .manage(host_meta_cache)
+        .manage(deployment_sender)
+        .manage(queue_clone.receiver.clone())
         .mount(
             "/",
             FileServer::new(Path::new("frontend"), Options::Index | Options::Missing),

@@ -23,7 +23,9 @@
  * THE SOFTWARE.
  * =========================LICENSE_END==================================
  */
+mod deployment_queue;
 mod host_meta_cache;
+mod peekable_receiver;
 mod routes;
 
 pub use crate::apps::AppsService as Apps;
@@ -36,6 +38,7 @@ use crate::models::{AppName, AppStatusChangeId, LogChunk, ServiceConfig};
 use crate::registry::Registry;
 use crate::registry::RegistryError;
 use chrono::{DateTime, FixedOffset};
+pub use deployment_queue::DeploymentQueue;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use handlebars::RenderError;
